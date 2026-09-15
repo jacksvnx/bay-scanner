@@ -32,6 +32,7 @@ import uuid
 import glob
 import subprocess
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from io import BytesIO
 
 import requests
@@ -124,11 +125,18 @@ def save_json(path, data):
 
 # ---------------- STEP 1: PULL NEW ARCHIVES ----------------
 
+LOCAL_TZ = ZoneInfo("America/Chicago")   # Bay County, FL is Central time
+
+
 def fetch_new_archives(feed_id, processed):
     """Downloads any archive segments for today not already in `processed`. Returns list of local mp3 paths."""
-    today = datetime.now(timezone.utc).strftime("%m/%d/%y")
+    # Broadcastify's archive endpoint wants MM/DD/YYYY (4-digit year) and works off
+    # the feed's local date, not UTC — a UTC date late in the evening asks for
+    # tomorrow locally and comes back empty.
+    today = datetime.now(LOCAL_TZ).strftime("%m/%d/%Y")
     out_dir = f"archives/{feed_id}"
     os.makedirs(out_dir, exist_ok=True)
+    print(f"[feed {feed_id}] requesting archives for {today}")
     result = subprocess.run(
         ["broadcastify-cli", "download", "--feed-id", str(feed_id), "--date", today],
         check=False, capture_output=True, text=True,
@@ -231,7 +239,7 @@ def build_image(post, incident_id, lat=None, lon=None):
     draw.rounded_rectangle([50, IMG_H - 440, 50 + tw + 32, IMG_H - 386], radius=8, fill=color)
     draw.text((66, IMG_H - 432), post["category"], font=badge_font, fill="white")
 
-    draw.text((50, IMG_H - 370), f"Bay County · {datetime.now().strftime('%a, %b %-d, %-I:%M %p')}",
+    draw.text((50, IMG_H - 370), f"Bay County · {datetime.now(LOCAL_TZ).strftime('%a, %b %-d, %-I:%M %p')}",
                font=get_font(26), fill=(220, 220, 220))
 
     head_font = get_font(52, bold=True)
@@ -331,7 +339,7 @@ def main():
 
                 incident = {
                     "id": incident_id, "ts": datetime.now(timezone.utc).isoformat(),
-                    "when": datetime.now().strftime("%a, %b %-d %-I:%M %p"),
+                    "when": datetime.now(LOCAL_TZ).strftime("%a, %b %-d %-I:%M %p"),
                     "category": post["category"], "headline": post["headline"], "body": post["body"],
                     "lat": coords[0] if coords else None, "lon": coords[1] if coords else None,
                     "feed": feed_name,
