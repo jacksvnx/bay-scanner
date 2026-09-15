@@ -129,14 +129,15 @@ def fetch_new_archives(feed_id, processed):
     today = datetime.now(timezone.utc).strftime("%m/%d/%y")
     out_dir = f"archives/{feed_id}"
     os.makedirs(out_dir, exist_ok=True)
-    subprocess.run(
-        ["broadcastify-cli", "download", "--feed-id", str(feed_id), "--date", today,
-         "--output", out_dir],
-        env={**os.environ, "USERNAME": BC_USER, "PASSWORD": BC_PASS},
-        check=False, capture_output=True,
+    result = subprocess.run(
+        ["broadcastify-cli", "download", "--feed-id", str(feed_id), "--date", today],
+        check=False, capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        print(f"[feed {feed_id}] download failed:\n{result.stdout}\n{result.stderr}")
     all_files = glob.glob(f"{out_dir}/**/*.mp3", recursive=True)
     new_files = [f for f in all_files if f not in processed]
+    print(f"[feed {feed_id}] {len(all_files)} archive file(s) on disk, {len(new_files)} new")
     return sorted(new_files)
 
 # ---------------- STEP 2: SEGMENT + TRANSCRIBE ----------------
