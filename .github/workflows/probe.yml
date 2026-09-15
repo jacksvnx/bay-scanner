@@ -1,0 +1,19 @@
+name: Probe Broadcastify Archives
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Probe
+        env:
+          BROADCASTIFY_USERNAME: ${{ secrets.BROADCASTIFY_USERNAME }}
+          BROADCASTIFY_PASSWORD: ${{ secrets.BROADCASTIFY_PASSWORD }}
+        run: python probe_archives.py
