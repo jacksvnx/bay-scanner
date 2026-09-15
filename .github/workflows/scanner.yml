@@ -27,18 +27,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu pkg-config \
-            libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
-            libavfilter-dev libswscale-dev libswresample-dev
-          # Main pipeline deps
+          sudo apt-get install -y ffmpeg fonts-dejavu
           pip install faster-whisper pydub requests anthropic pillow
-          # broadcastify-cli pins old requests/click/openai versions that would drag
-          # faster-whisper back to a release needing a source build of `av`, so it goes
-          # in its own isolated environment via pipx instead. The apt dev headers above
-          # are what let that older `av` actually compile.
-          pip install pipx
-          pipx install broadcastify-cli
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Run scanner pipeline
         env:
@@ -48,11 +38,16 @@ jobs:
           BROADCASTIFY_PASSWORD: ${{ secrets.BROADCASTIFY_PASSWORD }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SITE_BASE_URL: ${{ vars.SITE_BASE_URL }}
+        run: python scanner.py
+
+      - name: Commit and push new site content
         run: |
-          # broadcastify-cli reads credentials from a .env file in the working dir
-          printf 'USERNAME="%s"\nPASSWORD="%s"\n' "$BROADCASTIFY_USERNAME" "$BROADCASTIFY_PASSWORD" > .env
-          python scanner.py
-          rm -f .env
+          git config user.name "scanner-bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add docs/ state/
+          git diff --staged --quiet || git commit -m "New incidents $(date -u +%Y-%m-%dT%H:%M)"
+          git pull --rebase --autostash || true
+          git push
 
       - name: Commit and push new site content
         run: |
