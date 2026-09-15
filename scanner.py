@@ -3,9 +3,9 @@ Bay County Scanner -> AI stories -> static website + Discord notifications
 
 RUNS ENTIRELY IN GITHUB ACTIONS. No laptop/server needs to stay on.
 Every ~15 minutes (see .github/workflows/scanner.yml) this script:
-  1. Asks Broadcastify for any new 30-min archive blocks for Bay County's feeds
-  2. Downloads whatever's new (tracked in state/processed.json so nothing repeats)
-  3. Splits each block into individual transmissions, transcribes with Whisper
+  1. Records ~10 min of live audio from Bay County's feeds (Premium static URLs)
+  2. Splits that audio into individual transmissions using silence detection
+  3. Transcribes each transmission locally with Whisper
   4. Summarizes each one into a short story with Claude (decoding Bay County's
      Signal/10-codes), geocodes the location, and renders a map graphic
   5. Writes a page for each incident + updates the site's index into docs/
@@ -30,6 +30,7 @@ import sys
 import json
 import uuid
 import glob
+import base64
 import subprocess
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -127,26 +128,49 @@ def save_json(path, data):
 
 LOCAL_TZ = ZoneInfo("America/Chicago")   # Bay County, FL is Central time
 
+# How long to record from each live feed per run. The workflow runs every 15 minutes,
+# so 10 minutes of audio leaves headroom for transcription and publishing.
+RECORD_SECONDS = 600
 
-def fetch_new_archives(feed_id, processed):
-    """Downloads any archive segments for today not already in `processed`. Returns list of local mp3 paths."""
-    # Broadcastify's archive endpoint wants MM/DD/YYYY (4-digit year) and works off
-    # the feed's local date, not UTC — a UTC date late in the evening asks for
-    # tomorrow locally and comes back empty.
-    today = datetime.now(LOCAL_TZ).strftime("%m/%d/%Y")
-    out_dir = f"archives/{feed_id}"
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"[feed {feed_id}] requesting archives for {today}")
-    result = subprocess.run(
-        ["broadcastify-cli", "download", "--feed-id", str(feed_id), "--date", today],
-        check=False, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"[feed {feed_id}] download failed:\n{result.stdout}\n{result.stderr}")
-    all_files = glob.glob(f"{out_dir}/**/*.mp3", recursive=True)
-    new_files = [f for f in all_files if f not in processed]
-    print(f"[feed {feed_id}] {len(all_files)} archive file(s) on disk, {len(new_files)} new")
-    return sorted(new_files)
+
+def record_feeds():
+    """
+    Records RECORD_SECONDS of live audio from each feed in parallel.
+
+    Uses Broadcastify's Premium static stream URLs (https://audio.broadcastify.com/<id>.mp3),
+    which are a documented Premium feature and need HTTP basic auth with your account
+    login. This replaced the old archive-download approach after Broadcastify rebuilt
+    their archives section and the unofficial archive endpoint stopped existing.
+
+    Returns a list of (feed_id, feed_name, mp3_path) for recordings that produced audio.
+    """
+    token = base64.b64encode(f"{BC_USER}:{BC_PASS}".encode()).decode()
+    os.makedirs("recordings", exist_ok=True)
+
+    procs = []
+    for feed_id, feed_name in FEEDS.items():
+        out_path = f"recordings/{feed_id}_{uuid.uuid4().hex[:8]}.mp3"
+        cmd = [
+            "ffmpeg", "-y",
+            "-headers", f"Authorization: Basic {token}\r\n",
+            "-i", f"https://audio.broadcastify.com/{feed_id}.mp3",
+            "-t", str(RECORD_SECONDS),
+            "-c", "copy", out_path,
+            "-loglevel", "error",
+        ]
+        print(f"[feed {feed_id}] recording {RECORD_SECONDS}s from live stream...")
+        procs.append((feed_id, feed_name, out_path, subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)))
+
+    results = []
+    for feed_id, feed_name, out_path, proc in procs:
+        _, err = proc.communicate()
+        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+        if size < 10_000:
+            print(f"[feed {feed_id}] recording failed or empty ({size} bytes). ffmpeg said: {err.strip()[:500]}")
+            continue
+        print(f"[feed {feed_id}] recorded {size // 1024} KB")
+        results.append((feed_id, feed_name, out_path))
+    return results
 
 # ---------------- STEP 2: SEGMENT + TRANSCRIBE ----------------
 
@@ -318,45 +342,44 @@ def notify_discord(post, incident_id, image_path):
 # ---------------- MAIN ----------------
 
 def main():
-    processed = load_json(STATE_PATH, [])
     all_incidents = load_json(INCIDENTS_PATH, [])
     new_count = 0
 
-    for feed_id, feed_name in FEEDS.items():
-        for mp3_path in fetch_new_archives(feed_id, processed):
-            for clip_path in split_into_transmissions(mp3_path):
-                transcript = transcribe(clip_path)
-                os.remove(clip_path)
-                if not transcript:
-                    continue
-                post = summarize(transcript)
-                if not post:
-                    continue
+    for feed_id, feed_name, mp3_path in record_feeds():
+        clips = split_into_transmissions(mp3_path)
+        print(f"[feed {feed_id}] {len(clips)} transmission(s) detected")
+        os.remove(mp3_path)
 
-                incident_id = uuid.uuid4().hex[:10]
-                coords = geocode(post.get("location", ""))
-                image_path = build_image(post, incident_id, *(coords or (None, None)))
+        for clip_path in clips:
+            transcript = transcribe(clip_path)
+            os.remove(clip_path)
+            if not transcript:
+                continue
+            post = summarize(transcript)
+            if not post:
+                continue
 
-                incident = {
-                    "id": incident_id, "ts": datetime.now(timezone.utc).isoformat(),
-                    "when": datetime.now(LOCAL_TZ).strftime("%a, %b %-d %-I:%M %p"),
-                    "category": post["category"], "headline": post["headline"], "body": post["body"],
-                    "lat": coords[0] if coords else None, "lon": coords[1] if coords else None,
-                    "feed": feed_name,
-                }
-                all_incidents.append(incident)
-                notify_discord(post, incident_id, image_path)
-                new_count += 1
+            incident_id = uuid.uuid4().hex[:10]
+            coords = geocode(post.get("location", ""))
+            image_path = build_image(post, incident_id, *(coords or (None, None)))
 
-            processed.append(mp3_path)
+            incident = {
+                "id": incident_id, "ts": datetime.now(timezone.utc).isoformat(),
+                "when": datetime.now(LOCAL_TZ).strftime("%a, %b %-d %-I:%M %p"),
+                "category": post["category"], "headline": post["headline"], "body": post["body"],
+                "lat": coords[0] if coords else None, "lon": coords[1] if coords else None,
+                "feed": feed_name,
+            }
+            all_incidents.append(incident)
+            notify_discord(post, incident_id, image_path)
+            new_count += 1
 
     if new_count:
         write_pages(all_incidents)
-        save_json(STATE_PATH, processed)
         save_json(INCIDENTS_PATH, all_incidents)
         print(f"Published {new_count} new incident(s).")
     else:
-        print("Nothing new this run.")
+        print("Nothing publishable this run.")
 
 
 if __name__ == "__main__":
