@@ -3,8 +3,9 @@ Bay County Scanner -> AI stories -> static website + Discord notifications
 
 RUNS ENTIRELY IN GITHUB ACTIONS. No laptop/server needs to stay on.
 Every ~15 minutes (see .github/workflows/scanner.yml) this script:
-  1. Records ~10 min of live audio from Bay County's feeds (Premium static URLs)
-  2. Splits that audio into individual transmissions using silence detection
+  1. Lists Bay County's 30-min archive blocks via Broadcastify's archive API and
+     downloads any not already processed (tracked in state/processed.json)
+  2. Splits each block into individual transmissions using silence detection
   3. Transcribes each transmission locally with Whisper
   4. Summarizes each one into a short story with Claude (decoding Bay County's
      Signal/10-codes), geocodes the location, and renders a map graphic
@@ -30,7 +31,6 @@ import sys
 import json
 import uuid
 import glob
-import base64
 import subprocess
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -128,48 +128,101 @@ def save_json(path, data):
 
 LOCAL_TZ = ZoneInfo("America/Chicago")   # Bay County, FL is Central time
 
-# How long to record from each live feed per run. The workflow runs every 15 minutes,
-# so 10 minutes of audio leaves headroom for transcription and publishing.
-RECORD_SECONDS = 600
+BCFY_BASE = "https://www.broadcastify.com/archives"
+
+# How many of the most recent archive blocks to consider each run. Blocks are 30 min,
+# so 3 covers ~90 minutes of lookback — plenty of slack if a run is skipped or delayed.
+LOOKBACK_BLOCKS = 3
 
 
-def record_feeds():
+def bcfy_session():
+    """Logs into Broadcastify and returns an authenticated session."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"),
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    s.post("https://www.broadcastify.com/login/",
+           data={"username": BC_USER, "password": BC_PASS,
+                 "action": "auth", "redirect": "https://www.broadcastify.com/"},
+           timeout=30)
+    if "bcfyuser1" not in s.cookies:
+        print("WARNING: Broadcastify login did not set the expected session cookie.")
+    return s
+
+
+def list_archives(s, feed_id, date_str):
+    """Returns the day's archive blocks, newest first. Each has id/start/startTs/duration."""
+    r = s.get(f"{BCFY_BASE}/api/archives.php",
+              params={"feedId": feed_id, "date": date_str}, timeout=30)
+    if r.status_code != 200:
+        print(f"[feed {feed_id}] archive list HTTP {r.status_code}")
+        return []
+    try:
+        return r.json().get("archives", [])
+    except Exception as e:
+        print(f"[feed {feed_id}] archive list not JSON: {e} | body starts: {r.text[:200]}")
+        return []
+
+
+def download_archive(s, archive_id, dest):
+    """Resolves an archive id to its MP3 URL and downloads it. Returns True on success."""
+    r = s.get(f"{BCFY_BASE}/api/play.php", params={"id": archive_id}, timeout=30)
+    if r.status_code != 200:
+        print(f"  {archive_id}: play API HTTP {r.status_code}")
+        return False
+    try:
+        url = r.json().get("url")
+    except Exception:
+        print(f"  {archive_id}: play API not JSON | {r.text[:200]}")
+        return False
+    if not url:
+        print(f"  {archive_id}: no audio URL in play API response")
+        return False
+
+    audio = s.get(url, timeout=180, stream=True)
+    if audio.status_code != 200:
+        print(f"  {archive_id}: audio HTTP {audio.status_code}")
+        return False
+    with open(dest, "wb") as f:
+        for chunk in audio.iter_content(1 << 16):
+            f.write(chunk)
+    print(f"  {archive_id}: downloaded {os.path.getsize(dest) // 1024} KB")
+    return True
+
+
+def fetch_new_archives(processed):
     """
-    Records RECORD_SECONDS of live audio from each feed in parallel.
+    Pulls any archive blocks not yet processed.
 
-    Uses Broadcastify's Premium static stream URLs (https://audio.broadcastify.com/<id>.mp3),
-    which are a documented Premium feature and need HTTP basic auth with your account
-    login. This replaced the old archive-download approach after Broadcastify rebuilt
-    their archives section and the unofficial archive endpoint stopped existing.
+    Broadcastify keeps 30-minute archive blocks for 365 days, listed via
+    /archives/api/archives.php and resolved to audio via /archives/api/play.php.
+    Both need a logged-in Premium session.
 
-    Returns a list of (feed_id, feed_name, mp3_path) for recordings that produced audio.
+    Returns a list of (feed_id, feed_name, mp3_path, block_start_ts).
     """
-    token = base64.b64encode(f"{BC_USER}:{BC_PASS}".encode()).decode()
-    os.makedirs("recordings", exist_ok=True)
-
-    procs = []
-    for feed_id, feed_name in FEEDS.items():
-        out_path = f"recordings/{feed_id}_{uuid.uuid4().hex[:8]}.mp3"
-        cmd = [
-            "ffmpeg", "-y",
-            "-headers", f"Authorization: Basic {token}\r\n",
-            "-i", f"https://audio.broadcastify.com/{feed_id}.mp3",
-            "-t", str(RECORD_SECONDS),
-            "-c", "copy", out_path,
-            "-loglevel", "error",
-        ]
-        print(f"[feed {feed_id}] recording {RECORD_SECONDS}s from live stream...")
-        procs.append((feed_id, feed_name, out_path, subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)))
-
+    s = bcfy_session()
+    date_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    os.makedirs("archives", exist_ok=True)
     results = []
-    for feed_id, feed_name, out_path, proc in procs:
-        _, err = proc.communicate()
-        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-        if size < 10_000:
-            print(f"[feed {feed_id}] recording failed or empty ({size} bytes). ffmpeg said: {err.strip()[:500]}")
+
+    for feed_id, feed_name in FEEDS.items():
+        blocks = list_archives(s, feed_id, date_str)
+        print(f"[feed {feed_id}] {len(blocks)} block(s) listed for {date_str}")
+
+        candidates = [b for b in blocks if b.get("id") not in processed][:LOOKBACK_BLOCKS]
+        if not candidates:
+            print(f"[feed {feed_id}] nothing new")
             continue
-        print(f"[feed {feed_id}] recorded {size // 1024} KB")
-        results.append((feed_id, feed_name, out_path))
+
+        for block in candidates:
+            aid = block["id"]
+            dest = f"archives/{aid}.mp3"
+            if download_archive(s, aid, dest):
+                results.append((feed_id, feed_name, dest, block.get("startTs")))
+                processed.append(aid)
+
     return results
 
 # ---------------- STEP 2: SEGMENT + TRANSCRIBE ----------------
@@ -244,7 +297,8 @@ def wrap_text(draw, text, font, max_width):
     return lines
 
 
-def build_image(post, incident_id, lat=None, lon=None):
+def build_image(post, incident_id, lat=None, lon=None, when=None):
+    when = when or datetime.now(LOCAL_TZ)
     if lat is not None and MAPBOX_TOKEN:
         map_url = (f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
                    f"pin-l+e63232({lon},{lat})/{lon},{lat},14,0/{IMG_W}x{IMG_H}@2x?access_token={MAPBOX_TOKEN}")
@@ -263,7 +317,7 @@ def build_image(post, incident_id, lat=None, lon=None):
     draw.rounded_rectangle([50, IMG_H - 440, 50 + tw + 32, IMG_H - 386], radius=8, fill=color)
     draw.text((66, IMG_H - 432), post["category"], font=badge_font, fill="white")
 
-    draw.text((50, IMG_H - 370), f"Bay County · {datetime.now(LOCAL_TZ).strftime('%a, %b %-d, %-I:%M %p')}",
+    draw.text((50, IMG_H - 370), f"Bay County · {when.strftime('%a, %b %-d, %-I:%M %p')}",
                font=get_font(26), fill=(220, 220, 220))
 
     head_font = get_font(52, bold=True)
@@ -342,13 +396,18 @@ def notify_discord(post, incident_id, image_path):
 # ---------------- MAIN ----------------
 
 def main():
+    processed = load_json(STATE_PATH, [])
     all_incidents = load_json(INCIDENTS_PATH, [])
     new_count = 0
 
-    for feed_id, feed_name, mp3_path in record_feeds():
+    for feed_id, feed_name, mp3_path, start_ts in fetch_new_archives(processed):
         clips = split_into_transmissions(mp3_path)
-        print(f"[feed {feed_id}] {len(clips)} transmission(s) detected")
+        print(f"[feed {feed_id}] {len(clips)} transmission(s) detected in {os.path.basename(mp3_path)}")
         os.remove(mp3_path)
+
+        # Timestamp incidents from when the archive block actually aired, not "now"
+        block_time = (datetime.fromtimestamp(start_ts, LOCAL_TZ) if start_ts
+                      else datetime.now(LOCAL_TZ))
 
         for clip_path in clips:
             transcript = transcribe(clip_path)
@@ -361,11 +420,13 @@ def main():
 
             incident_id = uuid.uuid4().hex[:10]
             coords = geocode(post.get("location", ""))
-            image_path = build_image(post, incident_id, *(coords or (None, None)))
+            image_path = build_image(post, incident_id, *(coords or (None, None)),
+                                     when=block_time)
 
             incident = {
-                "id": incident_id, "ts": datetime.now(timezone.utc).isoformat(),
-                "when": datetime.now(LOCAL_TZ).strftime("%a, %b %-d %-I:%M %p"),
+                "id": incident_id,
+                "ts": block_time.astimezone(timezone.utc).isoformat(),
+                "when": block_time.strftime("%a, %b %-d %-I:%M %p"),
                 "category": post["category"], "headline": post["headline"], "body": post["body"],
                 "lat": coords[0] if coords else None, "lon": coords[1] if coords else None,
                 "feed": feed_name,
@@ -373,6 +434,9 @@ def main():
             all_incidents.append(incident)
             notify_discord(post, incident_id, image_path)
             new_count += 1
+
+    # Keep the processed list from growing forever (30-min blocks, 2 feeds ~= 96/day)
+    save_json(STATE_PATH, processed[-2000:])
 
     if new_count:
         write_pages(all_incidents)
